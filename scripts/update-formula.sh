@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Syncs Formula/roc.rb with the Roc release pinned in the website's install_roc.sh, and with the
-# roc-lang/examples revision pinned in the website's examples.json (used by the formula's test).
+# roc-lang/examples revision pinned in the website's examples.json (used by the formula's test) if its
+# examples pin that release.
 # Usage: scripts/update-formula.sh [website-ref]   (default: main; needs gh and curl)
 set -euo pipefail
 
 WEBSITE_REPO=roc-lang/www.roc-lang.org
+RELEASES_URL=https://github.com/roc-lang/roc/releases/download
 EXAMPLES_REPO=roc-lang/examples
 FORMULA="$(cd "$(dirname "$0")/.." && pwd)/Formula/roc.rb"
 
@@ -17,14 +19,17 @@ examples_json="$(raw examples.json)"
 # Reads `NAME="value"` from install_roc.sh.
 var() { sed -nE "s/^$1=\"([^\"]*)\"\$/\1/p" <<<"$install_sh"; }
 
-date="$(var VERSION_DATE)"
-build="$(var BUILD_ID)"
-if [[ ! "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ || ! "$build" =~ ^[0-9a-f]{7,40}$ ]]; then
-  echo "error: could not parse VERSION_DATE/BUILD_ID from install_roc.sh" >&2
+new_version="$(var VERSION)"
+if [[ ! "$new_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([_-]RC[0-9]+)?$ ]]; then
+  echo "error: could not parse VERSION from install_roc.sh" >&2
   exit 1
 fi
-new_version="$date-$build"
-old_version="$(sed -nE 's/^  version "(.*)"$/\1/p' "$FORMULA")"
+if [ "$(var BASE_URL)" != "$RELEASES_URL/\${VERSION}" ]; then
+  echo "error: unexpected BASE_URL in install_roc.sh" >&2
+  exit 1
+fi
+# All four urls hold the same version.
+old_version="$(sed -nE 's#^ *url "'"$RELEASES_URL"'/([^/]+)/.*#\1#p' "$FORMULA" | sort -u)"
 
 # Formula platform -> variable in install_roc.sh (parallel arrays: macOS ships bash 3.2)
 PLATFORMS=(macos_apple_silicon macos_x86_64 linux_arm64 linux_x86_64)
@@ -48,19 +53,28 @@ fi
 old_rev="$(sed -nE 's#^    url "https://github.com/'"$EXAMPLES_REPO"'/archive/([0-9a-f]{40})\.tar\.gz"$#\1#p' "$FORMULA")"
 
 OLD="$old_version" NEW="$new_version" \
-  perl -0777 -pi -e 's/\Q$ENV{OLD}\E/$ENV{NEW}/g or die "old version not found\n"' "$FORMULA"
+  perl -0777 -pi -e 's{(/download/)\Q$ENV{OLD}\E(/roc-\w+-)\Q$ENV{OLD}\E(\.tar\.gz")}{$1$ENV{NEW}$2$ENV{NEW}$3}g or die "old version not found\n"' "$FORMULA"
 for i in "${!PLATFORMS[@]}"; do
   PLATFORM="${PLATFORMS[$i]}" SHA="${shas[$i]}" \
-    perl -0777 -pi -e 's/(roc_nightly-\Q$ENV{PLATFORM}\E-[^"]*"\n\s*sha256 ")[0-9a-f]{64}/$1$ENV{SHA}/ or die "no sha256 line for $ENV{PLATFORM}\n"' "$FORMULA"
+    perl -0777 -pi -e 's/(roc-\Q$ENV{PLATFORM}\E-[^"]*"\n\s*sha256 ")[0-9a-f]{64}/$1$ENV{SHA}/ or die "no sha256 line for $ENV{PLATFORM}\n"' "$FORMULA"
 done
 
 if [ "$new_rev" != "$old_rev" ]; then
-  tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' EXIT
-  curl --proto '=https' --tlsv1.2 -fsSL -o "$tmp" "https://github.com/$EXAMPLES_REPO/archive/$new_rev.tar.gz"
-  examples_sha="$(shasum -a 256 "$tmp" | awk '{print $1}')"
-  OLD="$old_rev" NEW="$new_rev" SHA="$examples_sha" \
-    perl -0777 -pi -e 's/\Q$ENV{OLD}\E(\.tar\.gz"\n\s*sha256 ")[0-9a-f]{64}/$ENV{NEW}$1$ENV{SHA}/ or die "examples resource not found\n"' "$FORMULA"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  archive="$tmp/examples.tar.gz"
+  curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" "https://github.com/$EXAMPLES_REPO/archive/$new_rev.tar.gz"
+  tar -xzf "$archive" -C "$tmp"
+  # examples.json can lag behind install_roc.sh, and the test needs examples that pin this release.
+  # Headers spell the release 0.1.0_RC1 as 0.1.0-RC1.
+  if grep -rqF --include='*.roc' "roc: \"${new_version//_/-}\"" "$tmp"; then
+    examples_sha="$(shasum -a 256 "$archive" | awk '{print $1}')"
+    OLD="$old_rev" NEW="$new_rev" SHA="$examples_sha" \
+      perl -0777 -pi -e 's/\Q$ENV{OLD}\E(\.tar\.gz"\n\s*sha256 ")[0-9a-f]{64}/$ENV{NEW}$1$ENV{SHA}/ or die "examples resource not found\n"' "$FORMULA"
+  else
+    echo "examples ${new_rev:0:7} from examples.json do not pin $new_version, keeping ${old_rev:0:7}"
+    new_rev="$old_rev"
+  fi
 fi
 
 echo "Roc: $old_version -> $new_version, examples: ${old_rev:0:7} -> ${new_rev:0:7} (website $sha)"
