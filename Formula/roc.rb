@@ -60,6 +60,8 @@ class Roc < Formula
     examples = (testpath/"examples").children.select do |dir|
       dir.glob("**/*.roc").any? { |file| file.read.include?(pin) }
     end
+    # ElmWebApp needs Firefox, which cannot start in Homebrew's macOS test sandbox.
+    examples.reject! { |dir| dir.basename.to_s == "ElmWebApp" }
     refute_empty examples, "no example pins #{pin}"
     ENV["ROC"] = bin/"roc"
     system "bash", "ci_scripts/all_tests.sh", *examples.map { |dir| dir.basename.to_s }
